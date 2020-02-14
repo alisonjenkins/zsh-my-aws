@@ -1,0 +1,409 @@
+# instance-functions
+#
+# List, run, start, stop and ssh to Amazon AWS EC2 instances
+
+local PLUG_DIR
+PLUG_DIR=$(dirname ${(%):-%N})
+source "$PLUG_DIR/shared.inc"
+
+instances() {
+  # type: query
+  # returns instance id's and the name tag.
+  local inputs=$(__zma_read_inputs $@)
+
+  if __zma_read_switches ${inputs} | grep ^--debug > /dev/null; then
+    ZMA_DEBUG=true
+  else
+    ZMA_DEBUG=false
+  fi
+
+  local default_query='
+    Reservations[].Instances[][
+        InstanceId,
+        ImageId,
+        InstanceType,
+        State.Name,
+        [Tags[?Key==`Name`].Value][0][0],
+        LaunchTime,
+        Placement.AvailabilityZone
+    ]
+  '
+
+  local instance_ids=$(__zma_read_resources $inputs)
+  local filters=$(__zma_read_switches $inputs | grep ^--filters | cut -d\  -f2-)
+  local query=$(__zma_read_switches $inputs | grep ^--query | cut -d\  -f2-)
+  local output=$(__zma_read_switches $inputs | grep ^--output | cut -d\  -f2-)
+
+  if ${ZMA_DEBUG}; then
+    echo "inputs: ${inputs}"
+    echo "instance_ids: ${instance_ids}"
+    echo "filters: ${filters}"
+    echo "query: ${query}"
+    echo "output: ${output}"
+  fi
+
+  [[ -z $query ]] && local query=$default_query
+
+  local data=$(
+    aws ec2 describe-instances                                            \
+      $([[ -n ${instance_ids} ]] && echo --instance-ids ${instance_ids})  \
+      $([[ -n ${filters} ]] && echo "--filters ${filters}")               \
+      --query "${query}"                                                  \
+      --output ${output:-"text"}
+  )
+
+  case ${output:-"text"} in
+    "text") echo "${data}" | column -s$'\t' -t ;;
+    "json") echo "${data}" | jq . ;;
+    *)      echo "${data}" ;;
+  esac
+}
+
+instance-asg() {
+  # type: query
+  # returns the autoscaling group an instances is a member of
+  local inputs="$(__zma_read_inputs $@)"
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  local query='
+    Reservations[].Instances[][
+      {
+        "AutoscalingGroupName": [Tags[?Key==`aws:autoscaling:groupName`].Value][0][0],
+        "InstanceId": InstanceId
+      }
+    ][]
+  '
+  instances ${inputs} --query ${query} | grep -v ^None
+}
+
+instance-az() {
+  # type: query
+  # returns the availability zone of an instance
+  local inputs="$(__zma_read_inputs $@)"
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  local query='
+    Reservations[].Instances[][
+      [
+        InstanceId,
+        Placement.AvailabilityZone
+      ]
+    ][]
+  '
+  instances ${inputs} --query ${query} | grep -v ^None
+}
+
+instance-console() {
+  # type: detail
+  # returns the console output of an instance
+  local inputs=$(__zma_read_inputs $@)
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  for instance_id in $(__zma_read_resources ${inputs}); do
+    echo Console output for EC2 Instance $instance_id
+    aws ec2 get-console-output    \
+      --instance-id $instance_id  \
+      --query Output              \
+      --output text
+    echo
+  done
+}
+
+instance-dns() {
+  # type: detail
+  # returns the dns name of an instance
+  local inputs="$(__zma_read_inputs $@)"
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  local query='
+    Reservations[].Instances[][
+      {
+        "InstanceId": InstanceId,
+        "Private": PrivateDnsName,
+        "Public": PublicDnsName
+      }
+    ][]
+  '
+  instances ${inputs} --query ${query} | grep -v ^None
+}
+
+instance-iam-profile() {
+  # type: detail
+  # returns the iam-profile of an instance
+  local inputs="$(__zma_read_inputs $@)"
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  local query='
+    Reservations[].Instances[][
+      [
+        InstanceId,
+        IamInstanceProfile.Id
+      ]
+    ][]
+  '
+  instances ${inputs} --query ${query} | grep -v ^None
+}
+
+instance-ip() {
+  # type: detail
+  # returns the ip address of an instance
+  local inputs="$(__zma_read_inputs $@)"
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  local query='
+    Reservations[].Instances[][
+      {
+        "InstanceId": InstanceId,
+        "Private": PrivateIpAddress,
+        "Public": PublicIpAddress
+      }
+    ][]
+  '
+  instances ${inputs} --query ${query} | grep -v ^None
+}
+
+instance-ssh() {
+  # type: action
+  # connects to an instance via SSH
+  # XXX Does not work with input from STDIN
+
+  # TODO: this may be cleaner
+  #if [[ ! -t 0 ]] || [[ -z "$1" ]]; then
+  #  __zma_usage "instance_id [login-template-file]"
+  #  return 1
+  #fi
+  if ! [[ -t 0 ]]; then echo "Usage: $FUNCNAME instance_id [login]"; return 1; fi
+  if [ -z "$1" ] ; then echo "Usage: $FUNCNAME instance_id [login]"; return 1; fi
+
+  local instance_id=$1
+  if [ -n "$2" ]; then local user="$2"; fi
+  local instance_details="$(instance-ssh-details $1)"
+  local instance_id=$(echo $instance_details | awk '{print $1}');
+  local keyname=$(echo $instance_details | awk '{print $2}');
+  local private_ip=$(echo $instance_details | awk '{print $3}');
+  local instance_name=$(echo $instance_details | awk '{print $4}');
+  local instance_default_user=$(echo $instance_details | awk '{print $5}');
+
+  local USERNAME=${user:-${instance_default_user:-${AWS_DEFAULT_USER:-root}}}
+  echo "Connecting to EC2 Instance $instance_id '$instance_name'" 2>&1
+
+  ssh                                  \
+    -t                                \
+    -i ${zma_SSH_DIR:-~/.ssh/}$keyname \
+    -o LogLevel=error                  \
+    -o StrictHostKeyChecking=no        \
+    -o UserKnownHostsFile=/dev/null    \
+    -l $USERNAME                       \
+    $private_ip
+}
+
+instance-ssh-details() {
+  # type: detail
+  # returns the details needed to SSH into an instance
+  local inputs="$(__zma_read_inputs $@)"
+  [[ -z "${inputs}" ]] && __zma_usage "instance_id" && return 1
+
+  local query='
+    Reservations[].Instances[][
+      InstanceId,
+      KeyName,
+      (PublicIpAddress || PrivateIpAddress),
+      join(` `, [Tags[?Key==`Name`].Value][] || [`not-named`]),
+      join(` `, [Tags[?Key==`default-user`].Value][] || [``])
+    ]
+  '
+  instances ${inputs} --query ${query}
+}
+
+instance-stack() {
+  # type: detail
+  # returns the stack an instances is a member of
+  local inputs="$(__zma_read_inputs $@)"
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  local query='
+    Reservations[].Instances[][
+      [
+        [Tags[?Key==`aws:cloudformation:stack-name`].Value][0][0],
+        InstanceId
+      ]
+    ][]
+  '
+  instances ${inputs} --query ${query} | grep -v ^None
+}
+
+instance-start() {
+  # type: action
+  # starts a stopped instance
+  local inputs="$(__zma_read_inputs $@)"
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  aws ec2 start-instances --instance-ids $inputs
+}
+
+instance-state() {
+  # type: detail
+  # returns the state of an instance
+  local inputs="$(__zma_read_inputs $@)"
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  local query='
+    Reservations[].Instances[][
+      {
+        "InstanceId": InstanceId,
+        "State": State.Name
+      }
+    ][]
+  '
+  instances ${inputs} --query ${query}
+}
+
+instance-stop() {
+  # type: action
+  # stops a running instance
+  local inputs="$(__zma_read_inputs $@)"
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  aws ec2 stop-instances --instance-ids $inputs
+}
+
+# Replaces two older functions
+#
+# instances_with_tag() # instance_tags | grep expiry=
+# instances_without_tag() # instance_tags | grep -v expiry=
+#
+instance-tags() {
+  # type: detail
+  # returns the tags applied instances
+  local inputs="$(__zma_read_inputs $@)"
+  if [[ -z "$inputs" ]]; then
+    # Only return error if STDIN is a terminal
+    [[ -t 0 ]] && __zma_usage "instance-id [instance-id]" && return 1
+    # Piping a list of no instances should not return an error
+    return 0 
+  fi
+  local query='
+    Reservations[].Instances[].[
+      InstanceId,
+      join(`" "`, [Tags[].[join(`=`,[Key,Value])][]][])
+    ]
+  '
+  instances ${inputs} --query ${query}
+}
+
+instance-terminate() {
+  # type: action
+  # terminates an instance
+  local inputs
+  local instance_ids
+
+  inputs="$(__zma_read_inputs $@)"
+  instance_ids="$(__zma_read_resources $inputs)"
+
+  [[ -z "$instance_ids" ]] && __zma_usage "instance-id [instance-id]" && return 1
+
+  echo "You are about to terminate the following instances:"
+  echo "$instance_ids"
+  if [ -t 0 ]; then
+    read -p "Are you sure you want to continue? " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]
+    then
+      for instance_id in $instance_ids; do
+        aws ec2 modify-instance-attribute --attribute disableApiTermination --value false --instance-id "$instance_id"
+      done
+      aws ec2 terminate-instances --instance-ids "$instance_ids"
+    fi
+  else
+    echo "Warning. Piped input is disabled for this function for the time being"
+  fi
+}
+
+instance-type() {
+  # type: detail
+  # returns the type of an instance
+  local inputs
+  local query
+
+  inputs="$(__zma_read_inputs $@)"
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+
+  query='
+    Reservations[].Instances[][
+      [
+        InstanceId,
+        InstanceType
+      ]
+    ][]
+  '
+  instances "${inputs}" --query "${query}"
+}
+
+instance-userdata() {
+  # type: detail
+  # returns the userdata of an instance
+  local inputs
+  inputs=$(__zma_read_inputs $@)
+
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  for instance_id in $(__zma_read_resources ${inputs}); do
+    aws ec2 describe-instance-attribute \
+      --attribute userData              \
+      --instance-id "$instance_id"        \
+      --query UserData                  \
+      --output text                     |
+        base64 --decode
+  done
+}
+
+instance-volumes() {
+  # type: detail
+  # returns the volumes of an instance
+  local inputs
+  local query
+
+  inputs=$(__zma_read_inputs $@)
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+
+  query='
+    Reservations[].Instances[][
+      [
+        InstanceId,
+        join(` `, BlockDeviceMappings[].Ebs[].VolumeId)
+      ]
+    ][]
+  '
+  instances ${inputs} --query ${query} | grep -v ^None
+}
+
+instance-vpc() {
+  # type: detail
+  # returns the vpc of an instance
+  local inputs
+  local query
+
+  inputs=$(__zma_read_inputs $@)
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  query='
+    Reservations[].Instances[][
+      [
+        VpcId,
+        InstanceId
+      ]
+    ][]
+  '
+  instances ${inputs} --query ${query} | grep -v ^None
+}
+
+instance-credits() {
+  # type: detail
+  # returns the number of CPU credits available
+  local inputs
+  inputs=$(__zma_read_inputs $@)
+  [[ -z "$inputs" ]] && __zma_usage "instance-id [instance-id]" && return 1
+  for instance_id  in $(__zma_read_resources ${inputs}); do
+    local balance
+    balance=$(aws cloudwatch get-metric-statistics \
+      --dimensions "Name=InstanceId,Value=${instance_id}" \
+      --namespace 'AWS/EC2' \
+      --metric-name 'CPUCreditBalance' \
+      --start-time $(date -u '+%FT%TZ' -d '10 mins ago') \
+      --end-time $(date -u '+%FT%TZ') \
+      --period 300 \
+      --statistics Average \
+      --output text | head -2 | tail -1 | awk '{print $2}' )
+    echo "${instance_id} ${balance}"
+  done
+}
+
+# vim: ft=zsh
