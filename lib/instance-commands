@@ -2,8 +2,7 @@
 #
 # List, run, start, stop and ssh to Amazon AWS EC2 instances
 
-local PLUG_DIR
-PLUG_DIR=$(dirname ${(%):-%N})
+local PLUG_DIR=$(dirname ${(%):-%N})
 source "$PLUG_DIR/shared.inc"
 
 instances() {

@@ -1,5 +1,4 @@
-local PLUG_DIR
-PLUG_DIR=$(dirname ${(%):-%N})
+local PLUG_DIR=$(dirname ${(%):-%N})
 
 amr() {
     AWS_DEFAULT_REGION="$1"

@@ -2,8 +2,7 @@
 #
 # Source in the internal functions
 
-local PLUG_DIR
-PLUG_DIR=$(dirname ${(%):-%N})
+local PLUG_DIR=$(dirname ${(%):-%N})
 source "$PLUG_DIR/parameter.inc"
 
 __zma_error() {
